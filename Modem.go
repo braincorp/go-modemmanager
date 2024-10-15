@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/godbus/dbus/v5"
 	"reflect"
+
+	"github.com/godbus/dbus/v5"
 )
 
 // Paths of methods and properties
@@ -24,11 +25,14 @@ const (
 	ModemSetCurrentCapabilities = ModemInterface + ".SetCurrentCapabilities"
 	ModemSetCurrentModes        = ModemInterface + ".SetCurrentModes"
 	ModemSetCurrentBands        = ModemInterface + ".SetCurrentBands"
+	ModemSetPrimarySimSlot      = ModemInterface + ".SetPrimarySimSlot"
 	ModemCommand                = ModemInterface + ".Command"
 
 	/* Property */
 
 	ModemPropertySim                          = ModemInterface + ".Sim"                          //                           readable   o
+	ModemPropertySimSlots                     = ModemInterface + ".SimSlots"                     //    readable   ao
+	ModemPropertyPrimarySimSlot               = ModemInterface + ".PrimarySimSlot"               //    readable   u
 	ModemPropertyBearers                      = ModemInterface + ".Bearers"                      //    readable   ao
 	ModemPropertySupportedCapabilities        = ModemInterface + ".SupportedCapabilities"        //    readable   au
 	ModemPropertyCurrentCapabilities          = ModemInterface + ".CurrentCapabilities"          //     readable   u
@@ -147,6 +151,11 @@ type Modem interface {
 	// List of MMModemBand values, to specify the bands to be used.
 	SetCurrentBands([]MMModemBand) error
 
+	// Selects which SIM slot to be considered as primary, on devices that expose multiple slots in the "SimSlots" property.
+	// When the switch happens the modem may require a full device reprobe, so the modem object in DBus will get removed, and recreated once the selected SIM slot is in use.
+	// There is no limitation on which SIM slot to select, so the user may also set as primary a slot that doesn't currently have any valid SIM card inserted.
+	SetPrimarySimSlot(simSlot uint32) error
+
 	// AT command for the Modem:
 	// to enable either start mm in debug mode (ModemManager --debug) or with ModemManager --with-at-command-via-dbus
 	Command(cmd string, timeout uint32) (string, error)
@@ -154,7 +163,20 @@ type Modem interface {
 	/* PROPERTIES */
 
 	// The path of the SIM object available in this device, if any.
+	// This SIM object is the one used for network registration and data connection setup.
+	// If multiple org.freedesktop.ModemManager1.Modem.SimSlots are supported, the org.freedesktop.ModemManager1.Modem.PrimarySimSlot index value specifies which is the slot number where this SIM card is available.
 	GetSim() (Sim, error)
+
+	// The list of SIM slots available in the system, including the SIM object paths if the cards are present. If a given SIM slot at a given index doesn't have a SIM card available, an empty object path will be given.
+	// The length of this array of objects will be equal to the amount of available SIM slots in the system, and the index in the array is the slot index.
+	// This list includes the SIM object considered as primary active SIM slot (org.freedesktop.ModemManager1.Modem.Sim) at index org.freedesktop.ModemManager1.Modem.ActiveSimSlot.
+	GetSimSlots() ([]Sim, error)
+
+	// The index of the primary active SIM slot in the org.freedesktop.ModemManager1.Modem.SimSlots array, given in the [1,N] range.
+	// If multiple SIM slots aren't supported, this property will report value 0.
+	// In a Multi SIM Single Standby setup, this index identifies the only SIM that is currently active. All the remaining slots will be inactive.
+	// In a Multi SIM Multi Standby setup, this index identifies the active SIM that is considered primary, i.e. the one that will be used when a data connection is setup.
+	GetPrimarySimSlot() (uint32, error)
 
 	// The list of bearer object paths (EPS Bearers, PDP Contexts, or CDMA2000 Packet Data Sessions) as requested by the user.
 	// This list does not include the initial EPS bearer details (see "InitialEpsBearer").
@@ -456,6 +478,10 @@ func (m modem) SetCurrentBands(bands []MMModemBand) error {
 	return m.call(ModemSetCurrentBands, bands)
 }
 
+func (m modem) SetPrimarySimSlot(simSlot uint32) error {
+	return m.call(ModemSetPrimarySimSlot, simSlot)
+}
+
 func (m modem) Command(cmd string, timeout uint32) (response string, err error) {
 	err = m.callWithReturn(&response, ModemCommand, cmd, timeout)
 	return
@@ -467,6 +493,26 @@ func (m modem) GetSim() (Sim, error) {
 		return nil, err
 	}
 	return NewSim(simPath)
+}
+
+func (m modem) GetSimSlots() ([]Sim, error) {
+	simPaths, err := m.getSliceObjectProperty(ModemPropertySimSlots)
+	if err != nil {
+		return nil, err
+	}
+	var sims []Sim
+	for idx := range simPaths {
+		sim, err := NewSim(simPaths[idx])
+		if err != nil {
+			return nil, err
+		}
+		sims = append(sims, sim)
+	}
+	return sims, nil
+}
+
+func (m modem) GetPrimarySimSlot() (uint32, error) {
+	return m.getUint32Property(ModemPropertyPrimarySimSlot)
 }
 
 func (m modem) GetBearers() ([]Bearer, error) {
@@ -782,6 +828,22 @@ func (m modem) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	var simSlotsJson [][]byte
+	simSlots, err := m.GetSimSlots()
+	if err != nil {
+		return nil, err
+	}
+	for _, x := range simSlots {
+		tmpB, err := x.MarshalJSON()
+		if err != nil {
+			return nil, err
+		}
+		simSlotsJson = append(simSlotsJson, tmpB)
+	}
+	primarySimSlot, err := m.GetPrimarySimSlot()
+	if err != nil {
+		return nil, err
+	}
 	var bearersJson [][]byte
 	bearers, err := m.GetBearers()
 	if err != nil {
@@ -936,6 +998,8 @@ func (m modem) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(map[string]interface{}{
 		"Sim":                          simJson,
+		"SimSlots":                     simSlotsJson,
+		"PrimarySimSlot":               primarySimSlot,
 		"Bearers":                      bearersJson,
 		"SupportedCapabilities":        supportedCapabilities,
 		"CurrentCapabilities":          currentCapabilities,
